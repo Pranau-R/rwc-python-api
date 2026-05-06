@@ -63,14 +63,14 @@ class RwcSerialSetup:
         self.udpport = port
         self.udpipaddr = addr
 
-        self.log_dir = os.path.join(os.path.normpath(
-            os.getcwd() + os.sep + os.pardir), 'logs')
-        self.log_fname = os.path.join(self.log_dir, 'rwcapi.log')
+        # self.log_dir = os.path.join(os.path.normpath(
+        #     os.getcwd() + os.sep + os.pardir), 'logs')
+        # self.log_fname = os.path.join(self.log_dir, 'rwcapi.log')
         self.logger = logging.getLogger(__name__)
-        logging.basicConfig(filename = self.log_fname,
-                            format = '[%(asctime)s]: [%(name)s]: \
-[%(levelname)s]: [%(funcName)s:%(lineno)d]: %(message)s')
-        self.logger.setLevel(logging.DEBUG)
+        # logging.basicConfig(filename = self.log_fname,
+        #               format = '[%(asctime)s]: [%(name)s]: \
+        # [%(levelname)s]: [%(funcName)s:%(lineno)d]: %(message)s')
+        # self.logger.setLevel(logging.DEBUG)
 
     def open_port(self):
         '''

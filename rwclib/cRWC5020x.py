@@ -4778,20 +4778,47 @@ class RWCTesterApi(RwcSerialSetup):
         result = RwcSerialSetup.transceive(self, cmdGetMsgLength)
         return result
 
-    def link_setpayload(self, value):
+    # def link_setpayload(self, value):
+    #     '''
+    #     Configure the Message data of user-defined MAC command
+
+    #     :param value: 250-byte HEX value
+
+    #     :return: ACK on success, NAK on failure
+        
+    #     '''
+    #     cmdValue = int(value)
+    #     if (cmdValue >= 0 and cmdValue <= 2**250 -1) :
+    #         cmdHexValue = hex(cmdValue)
+    #         cmdSetPayload = 'CONF:LINK:PAYLOAD ' + cmdHexValue + '\n'
+    #         result = RwcSerialSetup.transceive(self, cmdSetPayload)
+    #         return result
+    #     else:
+    #         raise Exception('Invalid parameter received.')
+
+    def link_setpayload(self, value, payload_size):
         '''
         Configure the Message data of user-defined MAC command
-
-        :param value: 250-byte HEX value
-
-        :return: ACK on success, NAK on failure
-        
         '''
         cmdValue = int(value)
-        if (cmdValue >= 0 and cmdValue <= 2**250 -1) :
-            cmdHexValue = hex(cmdValue)
+        print(cmdValue)
+        print(payload_size)
+
+        if (cmdValue >= 0 and cmdValue <= 2**250 -1):
+
+            # Convert int → bytes using known payload size
+            payload_bytes = cmdValue.to_bytes(payload_size, byteorder="big")
+
+            # Single byte
+            if payload_size == 1:
+                cmdHexValue = "0x%02X" % payload_bytes[0]
+
+            # Multi byte
+            else:
+                cmdHexValue = "0x" + payload_bytes.hex().upper()
+
             cmdSetPayload = 'CONF:LINK:PAYLOAD ' + cmdHexValue + '\n'
-            result = RwcSerialSetup.transceive(self, cmdSetPayload)
+            result =  RwcSerialSetup.transceive(self, cmdSetPayload)
             return result
         else:
             raise Exception('Invalid parameter received.')
