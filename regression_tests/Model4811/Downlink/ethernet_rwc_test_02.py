@@ -2,6 +2,7 @@ import sys
 import time
 import os
 import re
+import csv
 
 sys.path.insert(0, os.path.abspath('..'))
 from rwclib.cRWC5020x import RWCTesterApi
@@ -12,6 +13,88 @@ class LinkAnalyzerTest(RWCTesterApi):
     def __init__(self, port, addr=None):
         RWCTesterApi.__init__(self, port, addr)
         RWCTesterApi.open_port(self)
+
+        # ---- CSV setup (single file, append mode) ----
+        self.csv_file = "rwc_mac_log_02.csv"
+
+        # Write header ONLY if file does not exist
+        if not os.path.exists(self.csv_file):
+            with open(self.csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["COMMAND", "DOWNLINK_PAYLOAD", "UPLINK_PAYLOAD"])
+
+    def log_new_cycle(self):
+        """
+        Function: log_new_cycle
+
+        Description:
+            Inserts a separator entry in the CSV log file to indicate
+            the start of a new MAC command test cycle.
+
+        Returns:
+            None
+        """
+        with open(self.csv_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["------------- DOWNLINK COMMANDS -------------", "", ""])
+
+    def decode_command_name(self, payload_hex):
+        """
+        Function: decode_command_name
+
+        Description:
+            Decodes a hex payload string into a human-readable
+            command name (e.g. "WRITE ENERGY_POS2_I32"), matching
+            the format used by the enum-driven builder in test_01.
+
+        Parameters:
+            payload_hex (str): Hexadecimal payload string
+
+        Returns:
+            str: Human-readable command name
+        """
+        cmd_map = {
+            "00": "READ",         "01": "WRITE",
+            "02": "RESET_DEVICE", "03": "GET_VERSION",
+            "04": "RESET_APPEUI", "05": "REJOIN",
+        }
+        reg_map = {
+            "0BB9": "ENERGY_POS1_I32",  "0BBB": "ENERGY_POS2_I32",
+            "0BBD": "ENERGY_POS3_I32",  "0BBF": "ENERGY_NEG1_I32",
+            "0BC1": "ENERGY_NEG2_I32",  "0BC3": "ENERGY_NEG3_I32",
+            "0BC5": "DEMAND1_F32",      "0BC7": "DEMAND2_F32",
+            "0BC9": "DEMAND3_F32",      "0BCB": "METERCONFIG1_I16",
+            "0BCC": "METERCONFIG2_I16", "0BCD": "METERCONFIG3_I16",
+        }
+        cmd_byte = payload_hex[0:2].upper()
+        cmd_name = cmd_map.get(cmd_byte, f"UNKNOWN_{cmd_byte}")
+        if cmd_byte in ("00", "01") and len(payload_hex) >= 8:
+            reg_hex = payload_hex[4:8].upper()
+            reg_name = reg_map.get(reg_hex, f"REG_{reg_hex}")
+            return f"{cmd_name} {reg_name}"
+        return cmd_name
+
+    def log_to_csv(self, command, downlink, uplink):
+        """
+        Function: log_to_csv
+
+        Description:
+            Logs MAC command execution details into the CSV report file.
+            Records the command name, transmitted downlink payload,
+            and received uplink payload for regression tracking
+            and post-analysis.
+
+        Parameters:
+            command  (str): Human-readable command name
+            downlink (str): Encoded downlink payload
+            uplink   (str): Parsed uplink payload
+
+        Returns:
+            None
+        """
+        with open(self.csv_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([command, downlink, uplink])
 
     def config_link_screen(self):
         screenparamdict = {'testmode': 'EDT', 'submenu': 'LINK'}
@@ -147,6 +230,8 @@ class LinkAnalyzerTest(RWCTesterApi):
 
     def config_mac(self):
         FPORT = 3
+        # 🔹 Mark start of new test cycle in CSV
+        self.log_new_cycle()
 
         payloads = {
             1: "0301",
@@ -183,11 +268,11 @@ class LinkAnalyzerTest(RWCTesterApi):
             RWCTesterApi.link_setmaccmdtype(self, "UNCONFIRMED")
 
             # -------- SEND MAC --------
-            print("Executing MAC Command (force send)")
             self.exec_mac()
-            
+
             print("Waiting for DataDown / DataUp...")
 
+            uplink_payload = ""
             got_uplink = False
             timeout = time.time() + 30   # max 30 sec wait
 
@@ -207,18 +292,25 @@ class LinkAnalyzerTest(RWCTesterApi):
 
                     if parsed_payload:
                         print("Parsed FRMPayload:", parsed_payload)
+                        uplink_payload = parsed_payload
                     else:
                         print("Unable to parse FRMPayload")
+                        uplink_payload = "PARSE_FAILED"
 
-                    # print("Uplink received for payload", payload_hex)
                     got_uplink = True
                     break
 
 
                 time.sleep(1)
 
+            # -------- HANDLE NO UPLINK --------
             if not got_uplink:
                 print("WARNING: No uplink received for payload", payload_hex)
+                uplink_payload = "NO_UPLINK"
+
+            # -------- CSV LOGGING --------
+            command_name = self.decode_command_name(payload_hex)
+            self.log_to_csv(command_name, payload_hex, uplink_payload)
 
             # -------- REST BEFORE NEXT PAYLOAD --------
             print("Waiting 15 seconds before next payload...\n")
