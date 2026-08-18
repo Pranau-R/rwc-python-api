@@ -86,6 +86,14 @@ class LinkAnalyzerTest(RWCTesterApi):
         # recent value is already known.
         self.last_known_boot = None
 
+        # ---- KeepAlive tracker ----
+        # Firmware runs keepalives for 5 min after every received
+        # downlink (kKeepAliveDecaySecs). This timestamp says when
+        # keepalives are expected to stop. Used by wait loops to pick
+        # short (60 s) or long (7 min) response timeouts. See
+        # Model4811_KeepAlive.cpp / Params::kKeepAliveDecaySecs.
+        self.keepalive_active_until = 0
+
         # ---- CSV setup (single file, append mode) ----
         self.csv_file = "rwc_mac_log.csv"
 
@@ -439,7 +447,8 @@ class LinkAnalyzerTest(RWCTesterApi):
             print("Failed to extract DevAddr:", e)
             return None
 
-    def handle_rejoin_response(self, payload_hex, delay_secs):
+    def handle_rejoin_response(self, payload_hex, delay_secs,
+                               payload_int, payload_size, send_fport):
         """
         Function: handle_rejoin_response
 
@@ -447,21 +456,31 @@ class LinkAnalyzerTest(RWCTesterApi):
             Handles the multi-stage REJOIN response flow that cannot be
             covered by the standard wait loop:
 
-                Stage 1: Wait up to (delay_secs + 60) s for the ACK
-                         uplink [05][tag][00]; capture OLD_DEVADDR.
-                         The firmware suspends keepalive uplinks during
-                         its spin loop, so the ACK only transmits after
-                         the device-side delay completes — the timeout
-                         must scale with delay_secs.
-                Stage 2: Watch the log stream up to 60 s for the
-                         "Join-request" and "Join-accept" markers.
+                Stage 1: Wait for the port-3 REJOIN ACK uplink
+                         [05][tag][00]. Timeout depends on the pre-send
+                         keepalive state:
+                             fast path → delay_secs + 60 s
+                             slow path → delay_secs + 420 s
+                         In slow path, also re-queue the REJOIN downlink
+                         every 60 s (keeps the tester's queue fresh
+                         across Port-1 gaps ~6 min apart).
+                Stage 2: Watch the log stream up to (delay_secs + 60) s
+                         for the "Join-request" and "Join-accept"
+                         markers. Timeout scales with delay_secs
+                         because the firmware sends the ACK first,
+                         then spins for delay_secs before calling
+                         LMIC_unjoinAndRejoin(), so Join-request
+                         appears ~delay_secs after the ACK.
                 Stage 3: Wait up to 90 s for a post-rejoin DataUp or
                          NoPayload uplink; capture POST_REJOIN_DEVADDR.
                 Stage 4: Compose status strings for CSV and console.
 
         Parameters:
-            payload_hex (str): Downlink REJOIN payload (for logging)
-            delay_secs  (int): Device-side rejoin delay in seconds
+            payload_hex   (str): Downlink REJOIN payload (for logging)
+            delay_secs    (int): Device-side rejoin delay in seconds
+            payload_int   (int): Downlink payload as integer (for refresh)
+            payload_size  (int): Downlink payload size in bytes
+            send_fport    (int): LoRaWAN FPort for the downlink
 
         Returns:
             tuple:
@@ -483,23 +502,44 @@ class LinkAnalyzerTest(RWCTesterApi):
         ack_payload = None
 
         # ---- Stage 1: wait for port-3 REJOIN ACK uplink ----
-        # Timeout scales with delay_secs because the firmware suspends
-        # keepalive uplinks during its spin loop; the ACK only goes out
-        # after the device-side delay completes.
-        ack_window = delay_secs + 60
-        print(f"REJOIN Stage 1: waiting for ACK uplink (port 3, up to {ack_window} s)...")
-        ack_timeout = time.time() + ack_window
+        # Fast/slow decision from keepalive tracker: same criterion
+        # used by config_mac's send phase. Determines timeout and
+        # whether to periodically refresh the tester's queue.
+        fast_path_send = time.time() < self.keepalive_active_until
+        ack_window = delay_secs + (60 if fast_path_send else 420)
+        do_refresh = not fast_path_send
+        stage1_start = time.time()
+        ack_timeout = stage1_start + ack_window
+        last_heartbeat = stage1_start
+        last_refresh = stage1_start
+        print(f"REJOIN Stage 1: waiting for ACK uplink (port 3, up to {ack_window} s"
+              f"{', with periodic refresh' if do_refresh else ''})...")
         got_ack = False
         while time.time() < ack_timeout:
             msg = RWCTesterApi.link_readmsg(self)
             if not msg or msg == "NA":
+                if time.time() - last_heartbeat >= 60:
+                    elapsed = int(time.time() - stage1_start)
+                    remaining = int(ack_timeout - time.time())
+                    print(f"  [waiting for REJOIN ACK: {elapsed} s elapsed, {remaining} s remaining]")
+                    last_heartbeat = time.time()
+                if do_refresh and time.time() - last_refresh >= 60:
+                    print("  [refresh: re-queueing REJOIN downlink to keep tester state fresh]")
+                    RWCTesterApi.link_setinstantmaccmd(self, 1, "USER_DEFINED")
+                    RWCTesterApi.link_setfport(self, send_fport)
+                    RWCTesterApi.link_setpayloadsize(self, payload_size)
+                    RWCTesterApi.link_setpayload(self, payload_int, payload_size)
+                    RWCTesterApi.link_setmaccmdtype(self, "UNCONFIRMED")
+                    self.exec_mac()
+                    last_refresh = time.time()
                 time.sleep(1)
                 continue
             self.cache_boot_if_port1(msg)
+            print("  [msg]", msg)
             if "DataUp" in str(msg):
-                fport = self.extract_fport(msg)
-                if fport != 3:
-                    print(f"Ignoring uplink on port {fport} (waiting for port 3)")
+                msg_fport = self.extract_fport(msg)
+                if msg_fport != 3:
+                    print(f"Ignoring uplink on port {msg_fport} (waiting for port 3)")
                     continue
                 parsed = self.parse_uplink_payload(msg)
                 if not parsed:
@@ -515,6 +555,7 @@ class LinkAnalyzerTest(RWCTesterApi):
                 old_devaddr = self.extract_devaddr(msg)
                 print("Parsed FRMPayload:", parsed)
                 print("REJOIN ACK received. OLD_DEVADDR:", old_devaddr)
+                self._mark_downlink_delivered()
                 got_ack = True
                 break
             time.sleep(1)
@@ -526,8 +567,13 @@ class LinkAnalyzerTest(RWCTesterApi):
         # No additional sleep needed: the ACK already arrived after the
         # firmware's delay completed, so the join exchange follows
         # within a few seconds.
-        print("REJOIN Stage 2: watching for Join-request / Join-accept (60 s)...")
-        join_timeout = time.time() + 60
+        # Stage 2 timeout scales with delay_secs because the firmware
+        # sends the ACK first, THEN spins for delay_secs before calling
+        # LMIC_unjoinAndRejoin(). Join-request appears roughly delay_secs
+        # after the ACK. delay_secs + 60 gives comfortable margin.
+        join_window = delay_secs + 60
+        print(f"REJOIN Stage 2: watching for Join-request / Join-accept ({join_window} s)...")
+        join_timeout = time.time() + join_window
         while time.time() < join_timeout:
             msg = RWCTesterApi.link_readmsg(self)
             if not msg or msg == "NA":
@@ -535,6 +581,7 @@ class LinkAnalyzerTest(RWCTesterApi):
                 continue
 
             self.cache_boot_if_port1(msg)
+            print("  [msg]", msg)
 
             if "Join-request" in str(msg):
                 print(">>>", msg)
@@ -558,6 +605,7 @@ class LinkAnalyzerTest(RWCTesterApi):
                     time.sleep(1)
                     continue
                 self.cache_boot_if_port1(msg)
+                print("  [msg]", msg)
                 if "DataUp" in str(msg) or "NoPayload" in str(msg):
                     new_devaddr = self.extract_devaddr(msg)
                     print("Post-rejoin uplink received. POST_REJOIN_DEVADDR:", new_devaddr)
@@ -669,13 +717,21 @@ class LinkAnalyzerTest(RWCTesterApi):
             int : Boot counter value
             None: If no Port-1 uplink with boot arrived in time
         """
-        deadline = time.time() + timeout_secs
+        start_time = time.time()
+        deadline = start_time + timeout_secs
+        last_heartbeat = start_time
         while time.time() < deadline:
             msg = RWCTesterApi.link_readmsg(self)
             if not msg or msg == "NA":
+                if time.time() - last_heartbeat >= 60:
+                    elapsed = int(time.time() - start_time)
+                    remaining = int(deadline - time.time())
+                    print(f"  [waiting for Port-1: {elapsed} s elapsed, {remaining} s remaining]")
+                    last_heartbeat = time.time()
                 time.sleep(1)
                 continue
             self.cache_boot_if_port1(msg)
+            print("  [msg]", msg)
             if "DataUp" in str(msg) and self.extract_fport(msg) == 1:
                 boot = self.extract_boot_from_port1(msg)
                 if boot is not None:
@@ -683,7 +739,126 @@ class LinkAnalyzerTest(RWCTesterApi):
             time.sleep(1)
         return None
 
-    def handle_reset_response(self):
+    def _mark_downlink_delivered(self):
+        """
+        Function: _mark_downlink_delivered
+
+        Description:
+            Marks that a downlink was just delivered to the device.
+            Advances self.keepalive_active_until to now + 5 min,
+            matching the firmware's kKeepAliveDecaySecs. Called
+            wherever we have evidence the device received a downlink
+            (response uplink for regular commands, ACK for REJOIN,
+            DataDown observation for RESET_DEVICE fast path).
+
+        Returns:
+            None
+        """
+        self.keepalive_active_until = time.time() + 300
+        ka_hms = time.strftime("%H:%M:%S", time.localtime(self.keepalive_active_until))
+        print(f"  [keepalive expected active until {ka_hms}]")
+
+    def _refresh_link_session(self):
+        """
+        Function: _refresh_link_session
+
+        Description:
+            Restarts the tester's Link Analyzer session by calling
+            link_stop followed by link_run. Used after RESET_DEVICE
+            to unstick the tester's message stream, which tends to
+            go silent for several minutes after processing a reset
+            downlink. Empirically observed: keepalive uplinks stop
+            appearing in link_readmsg output until the next scheduled
+            Port-1 uplink, blocking further downlink delivery.
+
+        Returns:
+            None
+        """
+        print("Refreshing tester link-analyzer session...")
+        RWCTesterApi.link_stop(self)
+        time.sleep(2)
+        RWCTesterApi.link_run(self)
+        time.sleep(2)
+
+    def wait_for_downlink_transmitted(self, timeout_secs):
+        """
+        Function: wait_for_downlink_transmitted
+
+        Description:
+            Watches the link message stream for a "DataDown" log
+            entry, which the tester emits when it actually
+            transmits a queued downlink on air. Used to confirm
+            the downlink went out (rather than just being ACKed
+            by the tester's control interface).
+
+        Parameters:
+            timeout_secs (int): Max wait window in seconds
+
+        Returns:
+            bool: True if DataDown observed, False on timeout
+        """
+        start_time = time.time()
+        deadline = start_time + timeout_secs
+        last_heartbeat = start_time
+        while time.time() < deadline:
+            msg = RWCTesterApi.link_readmsg(self)
+            if not msg or msg == "NA":
+                if time.time() - last_heartbeat >= 60:
+                    elapsed = int(time.time() - start_time)
+                    remaining = int(deadline - time.time())
+                    print(f"  [waiting for DataDown: {elapsed} s elapsed, {remaining} s remaining]")
+                    last_heartbeat = time.time()
+                time.sleep(1)
+                continue
+            self.cache_boot_if_port1(msg)
+            print("  [msg]", msg)
+            if "DataDown" in str(msg):
+                print(">>> DataDown observed:", msg)
+                return True
+            time.sleep(1)
+        return False
+
+    def wait_for_any_uplink(self, timeout_secs):
+        """
+        Function: wait_for_any_uplink
+
+        Description:
+            Blocks until any DataUp or NoPayload uplink from the
+            device arrives via link_readmsg, or the timeout expires.
+            Used in the slow-path send flow: when keepalives are off,
+            we wait for an uplink first, then refresh the tester's
+            instant-MAC state and exec_mac inside the RX window.
+
+            Also updates the boot cache opportunistically and prints
+            heartbeats every 60 s of silence.
+
+        Parameters:
+            timeout_secs (int): Max wait window in seconds
+
+        Returns:
+            bool: True if an uplink was observed, False on timeout
+        """
+        start_time = time.time()
+        deadline = start_time + timeout_secs
+        last_heartbeat = start_time
+        while time.time() < deadline:
+            msg = RWCTesterApi.link_readmsg(self)
+            if not msg or msg == "NA":
+                if time.time() - last_heartbeat >= 60:
+                    elapsed = int(time.time() - start_time)
+                    remaining = int(deadline - time.time())
+                    print(f"  [waiting for uplink: {elapsed} s elapsed, {remaining} s remaining]")
+                    last_heartbeat = time.time()
+                time.sleep(1)
+                continue
+            self.cache_boot_if_port1(msg)
+            print("  [msg]", msg)
+            if "DataUp" in str(msg) or "NoPayload" in str(msg):
+                return True
+            time.sleep(1)
+        return False
+
+    def handle_reset_response(self, payload_int, payload_size, fport):
         """
         Function: handle_reset_response
 
@@ -695,19 +870,37 @@ class LinkAnalyzerTest(RWCTesterApi):
             the boot counter byte inside the Port-1 data frame,
             which increments on every device reboot.
 
-                Step 1: Capture boot_before. Prefer the
-                        opportunistic cache (self.last_known_boot)
-                        if populated; otherwise wait up to 7 min
-                        for the next Port-1 uplink.
-                Step 2: Send the RESET_DEVICE downlink. (This
-                        handler is invoked *before* exec_mac in
-                        config_mac, so the send happens here.)
-                Step 3: Wait up to 8 min for the next Port-1
-                        uplink and read boot_after.
-                Step 4: Compare. boot_after != boot_before is
+                Step 1: Wait up to 7 min for a fresh Port-1 uplink
+                        to capture boot_before. The wait doubles as
+                        tester-state warmup.
+                Step 2: Re-run the tester's instant-MAC config,
+                        THEN send the reset downlink. The reconfig
+                        immediately before send prevents the
+                        tester's queued payload state from going
+                        stale during Step 1's long wait.
+                Step 3: Watch up to 30 s for a DataDown log entry
+                        (informational fast-pass). Firmware's
+                        KeepAlive stays active for 5 min after any
+                        received downlink; when active the tester
+                        delivers within ~20 s. When inactive the
+                        downlink may wait up to 6 min for the next
+                        Port-1 RX window. Absence of DataDown here
+                        is not a failure — boot_after in Step 4 is
+                        authoritative.
+                Step 4: Wait up to 15 min for the next Port-1
+                        uplink and read boot_after. Worst-case
+                        timing: downlink transmits at T+6 min
+                        (next Port-1), device reboots, next Port-1
+                        at T+12 min carries incremented boot.
+                Step 5: Compare. boot_after != boot_before is
                         proof the device rebooted. Update the
-                        cache so subsequent RESET tests can skip
-                        Step 1's wait.
+                        cache (informational only, no longer used
+                        to skip Step 1).
+
+        Parameters:
+            payload_int  (int): Downlink payload as integer
+            payload_size (int): Downlink payload size in bytes
+            fport        (int): LoRaWAN FPort for the downlink
 
         Returns:
             tuple:
@@ -720,28 +913,157 @@ class LinkAnalyzerTest(RWCTesterApi):
                                       RESET_FAIL_NO_PORT1_POST
         """
         # ---- Step 1: capture boot_before ----
+        # Three strategies, picked by state:
+        #   (a) Cache populated → use it (chained RESETs; also picks up
+        #       opportunistic Port-1 observations from earlier commands).
+        #   (b) Cache None AND slow path (keepalives off) → skip Step 1
+        #       entirely. Step 4's first Port-1 will carry the pre-reset
+        #       boot value (Port-1 payload is sent BEFORE the device
+        #       processes the downlink), which we capture as boot_before.
+        #       This saves the ~6 min separate Port-1 wait.
+        #   (c) Cache None AND fast path (keepalives active) → keep the
+        #       Step 1 wait. Delivery in fast path happens on the next
+        #       keepalive (~20 s), which carries no boot info. First
+        #       Port-1 after exec_mac would then be POST-reset — capturing
+        #       it as boot_before would be wrong. So capture boot_before
+        #       via wait_for_port1_boot BEFORE exec_mac.
         if self.last_known_boot is not None:
             boot_before = self.last_known_boot
-            print(f"RESET Step 1: using cached boot_before = {boot_before}")
+            print(f"RESET Step 1: using cached boot_before = {boot_before} "
+                  "(from previous RESET or Port-1 observation)")
+        elif time.time() >= self.keepalive_active_until:
+            # Slow path: safe to defer capture to Step 4's first Port-1.
+            boot_before = None
+            print("RESET Step 1: no cached boot_before, slow path — will "
+                  "capture from first Port-1 in Step 4.")
         else:
-            print("RESET Step 1: waiting for Port-1 uplink for boot_before (up to 7 min)...")
+            # Fast path with no cache: must capture boot_before BEFORE
+            # exec_mac to avoid the reset-then-Port-1 misidentification.
+            print("RESET Step 1: no cached boot_before, fast path — waiting "
+                  "for Port-1 uplink for boot_before (up to 7 min)...")
             boot_before = self.wait_for_port1_boot(420)
             if boot_before is None:
-                return "NO_REPLY", "RESET_FAIL_NO_PORT1_PRE"
+                result = "RESET_FAIL_NO_PORT1_PRE"
+                print(f"RESET result: {result}")
+                return "NO_REPLY", result
             print(f"RESET boot_before = {boot_before}")
 
-        # ---- Step 2: send the reset downlink ----
-        print("RESET Step 2: sending reset downlink...")
+        # ---- Step 2: refresh tester config + send the reset downlink ----
+        # The instant-MAC config was originally set at the top of the
+        # config_mac iteration, potentially minutes ago. Re-run it
+        # immediately before exec_mac so the tester has fresh state.
+        print("RESET Step 2: refreshing tester config and sending reset downlink...")
+        RWCTesterApi.link_setinstantmaccmd(self, 1, "USER_DEFINED")
+        RWCTesterApi.link_setfport(self, fport)
+        RWCTesterApi.link_setpayloadsize(self, payload_size)
+        RWCTesterApi.link_setpayload(self, payload_int, payload_size)
+        RWCTesterApi.link_setmaccmdtype(self, "UNCONFIRMED")
         self.exec_mac()
 
-        # ---- Step 3: capture boot_after (always a fresh read) ----
-        print("RESET Step 3: waiting for Port-1 uplink for boot_after (up to 8 min)...")
-        boot_after = self.wait_for_port1_boot(480)
+        # ---- Step 3: informational DataDown check (fast-pass when keepalives active) ----
+        # Per firmware (Model4811_KeepAlive.cpp + Params::kKeepAliveDecaySecs=300):
+        # any downlink extends the keepalive window by 5 min. If keepalives are
+        # active, the tester delivers our downlink in the next 20 s RX window and
+        # DataDown appears quickly. If keepalives are off (>5 min since last
+        # downlink received), DataDown may take up to 6 min (next Port-1). We do
+        # NOT fast-fail here — boot_after in Step 4 is the authoritative signal.
+        print("RESET Step 3: watching for DataDown (informational, up to 30 s)...")
+        data_down_seen = self.wait_for_downlink_transmitted(30)
+        if data_down_seen:
+            print("RESET: DataDown seen (fast path — keepalives were active)")
+            # Downlink was received by device — keepalive window extended.
+            self._mark_downlink_delivered()
+        else:
+            print("RESET: no DataDown in 30 s (slow path — keepalives likely off, "
+                  "downlink will transmit on next Port-1 uplink)")
+
+        # ---- Step 4: capture boot_after (always a fresh read) ----
+        # Timeout is 15 min to cover the slow path: worst case is downlink
+        # transmitting at T+6 min (next Port-1), device rebooting, next Port-1
+        # at T+12 min carrying the incremented boot value.
+        if data_down_seen:
+            print("RESET Step 4: boot_after expected in ~6 min (keepalives active). Timeout 15 min.")
+        else:
+            print("RESET Step 4: boot_after expected in ~12 min (slow path — waiting for "
+                  "next Port-1 to deliver downlink, then another ~6 min for boot_after Port-1). "
+                  "Timeout 15 min.")
+
+        # Inline wait loop for boot_after with periodic refresh + delivery
+        # guard. In slow path the tester's queued RESET downlink may expire
+        # between Port-1 uplinks; periodic refresh keeps the queue fresh so
+        # delivery happens on the next Port-1. Once we see DataDown (either
+        # from Step 3 or here mid-wait), we stop refreshing to prevent a
+        # second RESET downlink from causing a second reboot.
+        step4_deadline = time.time() + 900
+        step4_start = time.time()
+        step4_last_heartbeat = step4_start
+        step4_last_refresh = step4_start
+        delivery_observed = data_down_seen
+        boot_after = None
+
+        while time.time() < step4_deadline:
+            msg = RWCTesterApi.link_readmsg(self)
+            if not msg or msg == "NA":
+                if time.time() - step4_last_heartbeat >= 60:
+                    elapsed = int(time.time() - step4_start)
+                    remaining = int(step4_deadline - time.time())
+                    print(f"  [waiting for Port-1: {elapsed} s elapsed, {remaining} s remaining]")
+                    step4_last_heartbeat = time.time()
+                if not delivery_observed and time.time() - step4_last_refresh >= 60:
+                    print("  [refresh: re-queueing RESET downlink to keep tester state fresh]")
+                    RWCTesterApi.link_setinstantmaccmd(self, 1, "USER_DEFINED")
+                    RWCTesterApi.link_setfport(self, fport)
+                    RWCTesterApi.link_setpayloadsize(self, payload_size)
+                    RWCTesterApi.link_setpayload(self, payload_int, payload_size)
+                    RWCTesterApi.link_setmaccmdtype(self, "UNCONFIRMED")
+                    self.exec_mac()
+                    step4_last_refresh = time.time()
+                time.sleep(1)
+                continue
+
+            self.cache_boot_if_port1(msg)
+            print("  [msg]", msg)
+
+            # A DataDown here means the downlink was just transmitted.
+            # Delivery confirmed → stop refreshing to prevent a second reset.
+            if "DataDown" in str(msg) and not delivery_observed:
+                print("RESET Step 4: DataDown observed — delivery confirmed, stopping refresh.")
+                delivery_observed = True
+
+            # Handle boot_before capture (if deferred from Step 1) and
+            # boot_after detection. The Port-1 whose RX window delivered
+            # our RESET downlink was itself sent PRE-reset — its boot is
+            # boot_before. Only a Port-1 with a different boot value
+            # counts as boot_after.
+            if "DataUp" in str(msg) and self.extract_fport(msg) == 1:
+                boot_val = self.extract_boot_from_port1(msg)
+                if boot_val is not None:
+                    if boot_before is None:
+                        # First Port-1 in Step 4 — deferred boot_before
+                        # capture. This Port-1 is pre-reset (Port-1 was
+                        # sent before device processed the downlink).
+                        boot_before = boot_val
+                        print(f"  Step 4: boot_before captured from first Port-1 = {boot_before}")
+                    elif boot_val != boot_before:
+                        boot_after = boot_val
+                        break
+                    else:
+                        print(f"  Port-1 boot={boot_val} unchanged from boot_before — "
+                              "may be the delivery Port-1, continuing to wait...")
+
+            time.sleep(1)
+
         if boot_after is None:
-            return "NO_REPLY", f"RESET_FAIL_NO_PORT1_POST | boot_before={boot_before}"
+            if boot_before is None:
+                # Step 1 was deferred to Step 4 and no Port-1 ever arrived.
+                result = "RESET_FAIL_NO_PORT1_PRE"
+            else:
+                result = f"RESET_FAIL_NO_PORT1_POST | boot_before={boot_before}"
+            print(f"RESET result: {result}")
+            return "NO_REPLY", result
         print(f"RESET boot_after = {boot_after}")
 
-        # ---- Step 4: compare and update cache ----
+        # ---- Step 5: compare and update cache ----
         self.last_known_boot = boot_after
         if boot_after != boot_before:
             result = f"RESET_OK | boot {boot_before}->{boot_after}"
@@ -771,24 +1093,37 @@ class LinkAnalyzerTest(RWCTesterApi):
         payloads = [
             (Command.GET_VERSION,),
             (Command.RESET_APPEUI,),
-            (Command.RESET_DEVICE,),
-            (Command.RESET_DEVICE,),
-            # (Command.RESET_DEVICE,),
-
-            # (Command.WRITE, Register.ENERGY_POS2_I32, "000E000A"),
-            # (Command.READ,  Register.ENERGY_POS2_I32, "02"),
-
-            # (Command.WRITE, Register.ENERGY_POS3_I32, "000B000C"),
-            # (Command.READ,  Register.ENERGY_POS3_I32, "02"),
-            
-            # (Command.WRITE, Register.ENERGY_NEG1_I32, "000D"),
-            # (Command.READ,  Register.ENERGY_NEG1_I32, "01"),
-
-            # (Command.WRITE, Register.METERCONFIG2_I16, "00FF"),
-            # (Command.READ,  Register.METERCONFIG2_I16, "01"),
-
+            (Command.GET_VERSION,),
+            (Command.RESET_APPEUI,),
             (Command.REJOIN, None, "0005"),
-            # (Command.REJOIN, None, "00B4"),
+            (Command.WRITE, Register.ENERGY_POS2_I32, "000E000A"),
+            (Command.READ,  Register.ENERGY_POS2_I32, "02"),
+
+            (Command.RESET_DEVICE,),
+            (Command.RESET_DEVICE,),
+            (Command.REJOIN, None, "0005"),
+
+            (Command.WRITE, Register.ENERGY_POS2_I32, "000E000A"),
+            (Command.READ,  Register.ENERGY_POS2_I32, "02"),
+
+            (Command.WRITE, Register.ENERGY_POS3_I32, "000B000C"),
+            (Command.READ,  Register.ENERGY_POS3_I32, "02"),
+
+            (Command.WRITE, Register.ENERGY_NEG1_I32, "000D"),
+            (Command.READ,  Register.ENERGY_NEG1_I32, "01"),
+
+            (Command.WRITE, Register.METERCONFIG2_I16, "00FF"),
+            (Command.READ,  Register.METERCONFIG2_I16, "01"),
+
+            (Command.GET_VERSION,),
+            (Command.REJOIN, None, "0005"),
+            (Command.GET_VERSION,),
+            (Command.RESET_DEVICE,),
+            (Command.RESET_DEVICE,),
+            (Command.REJOIN, None, "00B4"),
+            (Command.WRITE, Register.ENERGY_POS3_I32, "000B000C"),
+            (Command.READ,  Register.ENERGY_POS3_I32, "02"),
+            (Command.RESET_DEVICE,),
         ]
 
         RWCTesterApi.link_setnumofmaccmd(self, 1)
@@ -821,41 +1156,100 @@ class LinkAnalyzerTest(RWCTesterApi):
             self.drain_uplinks()
 
             # -------- RESET_DEVICE: capture boot_before BEFORE send,
-            #         then send and verify reboot via boot counter
-            #         (handler calls exec_mac internally) --------
+            #         then send and verify reboot via boot counter.
+            #         Handler re-runs link_set* + exec_mac internally
+            #         so tester state is fresh at send time. Slow-path
+            #         is handled inside the handler (extended Step 4
+            #         timeout for keepalive-off scenarios). --------
             if cmd == Command.RESET_DEVICE:
-                uplink_payload, result = self.handle_reset_response()
+                uplink_payload, result = self.handle_reset_response(payload_int, payload_size, FPORT)
                 self.log_to_csv(command_name, payload_hex, uplink_payload, result)
                 print("Waiting 15 seconds before next payload...\n")
                 time.sleep(15)
                 continue
 
             # -------- SEND MAC --------
+            # exec_mac immediately for all paths. The response wait loop
+            # below runs periodic refresh every 60 s when in slow path,
+            # which keeps the tester's queued state fresh until the next
+            # uplink arrives and delivers our downlink. Previously we
+            # waited for an uplink first before exec_mac ("wait then
+            # send"), but that added ~6 min of latency in slow path
+            # without helping delivery — delivery happens on the NEXT
+            # uplink after exec_mac regardless of when exec_mac fires.
+            used_slow_path = time.time() >= self.keepalive_active_until
+            if used_slow_path:
+                print("Send phase: slow path (keepalives off). exec_mac now; "
+                      "delivery expected on next Port-1 (~up to 6 min).")
+            else:
+                print("Send phase: fast path (keepalives active). exec_mac now; "
+                      "delivery expected on next keepalive (~20 s).")
             self.exec_mac()
 
             # -------- REJOIN: route to specialized multi-stage handler --------
             if cmd == Command.REJOIN:
                 delay_secs = int(data, 16)
-                uplink_payload, result = self.handle_rejoin_response(payload_hex, delay_secs)
+                uplink_payload, result = self.handle_rejoin_response(
+                    payload_hex, delay_secs,
+                    payload_int, payload_size, FPORT
+                )
                 self.log_to_csv(command_name, payload_hex, uplink_payload, result)
                 print("Waiting 15 seconds before next payload...\n")
                 time.sleep(15)
                 continue
 
-            print("Waiting for DataDown / DataUp...")
+            # Response wait timeout depends on which send path we used:
+            #   fast path → 60 s (response comes on next 20 s keepalive)
+            #   slow path → 420 s (7 min; fallback for missed RX2 —
+            #                       tester delivers on next Port-1 ~6 min out)
+            # We can miss the RX2 of the just-consumed uplink in slow path
+            # because Python-side reaction time (~1-2 s) may put exec_mac
+            # too late. The 7 min timeout lets the next-Port-1 fallback
+            # succeed instead of prematurely reporting NO_UPLINK.
+            if used_slow_path:
+                wait_secs = 420
+                print(f"Waiting for port-3 response (slow-path fallback, up to {wait_secs} s)...")
+            else:
+                wait_secs = 60
+                print(f"Waiting for port-3 response ({wait_secs} s timeout)...")
 
             uplink_payload = ""
             got_uplink = False
-            timeout = time.time() + 60
+            wait_start = time.time()
+            timeout = wait_start + wait_secs
+            last_heartbeat = wait_start
+            # Periodic refresh: in slow path, the tester's queued downlink
+            # state expires within ~1-6 minutes of exec_mac (observed
+            # empirically). If a Port-1 arrives after the queue expired, no
+            # delivery happens. Re-run link_set* + exec_mac every 60 s to
+            # keep the queue fresh so any incoming uplink finds it ready.
+            # Skipped in fast path (keepalives active → response within 20 s).
+            last_refresh = wait_start
+            REFRESH_INTERVAL_SECS = 60
 
             while time.time() < timeout:
                 msg = RWCTesterApi.link_readmsg(self)
 
                 if not msg or msg == "NA":
+                    if time.time() - last_heartbeat >= 60:
+                        elapsed = int(time.time() - wait_start)
+                        remaining = int(timeout - time.time())
+                        print(f"  [waiting for response: {elapsed} s elapsed, {remaining} s remaining]")
+                        last_heartbeat = time.time()
+                    if used_slow_path and time.time() - last_refresh >= REFRESH_INTERVAL_SECS:
+                        print("  [refresh: re-queueing downlink to keep tester state fresh]")
+                        RWCTesterApi.link_setinstantmaccmd(self, 1, "USER_DEFINED")
+                        RWCTesterApi.link_setfport(self, FPORT)
+                        RWCTesterApi.link_setpayloadsize(self, payload_size)
+                        RWCTesterApi.link_setpayload(self, payload_int, payload_size)
+                        RWCTesterApi.link_setmaccmdtype(self, "UNCONFIRMED")
+                        self.exec_mac()
+                        last_refresh = time.time()
                     time.sleep(1)
                     continue
 
                 self.cache_boot_if_port1(msg)
+                print("  [msg]", msg)
 
                 if "DataUp" in str(msg):
                     # Port filter: only accept port 3 (downlink response port)
@@ -878,6 +1272,7 @@ class LinkAnalyzerTest(RWCTesterApi):
 
                     print("Parsed FRMPayload:", parsed_payload)
                     uplink_payload = parsed_payload
+                    self._mark_downlink_delivered()
                     got_uplink = True
                     break
 
@@ -1076,10 +1471,8 @@ if __name__ == '__main__':
         myobj.exec_link()
         myobj.config_mac()
 
-        print("\n--- Link Analyzer Running ---")
-
-        while True:
-            myobj.read_link_messages()
+        print("\n--- Test suite complete ---")
+        myobj.stop_link()
 
     except KeyboardInterrupt:
         print("\nCTRL + C pressed by user")
